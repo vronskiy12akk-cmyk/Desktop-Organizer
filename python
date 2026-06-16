@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+desktop_organizer.py - Органайзер рабочего стола на Python
+Поддерживает GUI (Tkinter) и CLI, настраиваемые правила, отмену действий.
+"""
+
+import os
+import sys
+import json
+import shutil
+import logging
+import argparse
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox, scrolledtext
+    GUI_AVAILABLE = True
+except ImportError:
+    GUI_AVAILABLE = False
+
+# Конфигурация по умолчанию
+DEFAULT_CONFIG = {
+    "categories": {
+        "Images": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp"],
+        "Documents": [".pdf", ".doc", ".docx", ".txt", ".md", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods"],
+        "Archives": [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"],
+        "Music": [".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"],
+        "Video": [".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm"],
+        "Programs": [".exe", ".msi", ".dmg", ".appimage", ".deb", ".rpm", ".sh", ".bat"],
+        "Others": []
+    },
+    "excluded_folders": ["Desktop Organizer", "System Volume Information"],
+    "excluded_files": ["desktop.ini", ".DS_Store", "Thumbs.db"],
+    "auto_sort_on_start": True
+}
+
+class DesktopOrganizer:
+    def __init__(self, config_path=None, log_path=None):
+        self.config = self.load_config(config_path)
+        self.log_path = log_path or Path("organizer.log")
+        self.history = []  # список (src, dst) для отмены
+        self.setup_logging()
+
+    def load_config(self, config_path):
+        if config_path and Path(config_path).exists():
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        else:
+            # создаём конфиг по умолчанию
+            with open("config.json", 'w', encoding='utf-8') as f:
+                json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
+            return DEFAULT_CONFIG
+
+    def setup_logging(self):
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(self.log_path, encoding='utf-8'),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+
+    def get_category(self, filename):
+        ext = Path(filename).suffix.lower()
+        for cat, exts in self.config["categories"].items():
+            if ext in exts:
+                return cat
+        return "Others"
+
+    def organize(self, folder_path, dry_run=False):
+        folder = Path(folder_path)
+        if not folder.exists():
+            logging.error(f"Папка {folder_path} не существует")
+            return
+        self.history.clear()
+        # Создаём папки для категорий
+        category_dirs = {}
+        for cat in self.config["categories"]:
+            cat_dir = folder / cat
+            if not cat_dir.exists() and not dry_run:
+                cat_dir.mkdir(parents=True)
+            category_dirs[cat] = cat_dir
+
+        excluded_folders = set(self.config.get("excluded_folders", []))
+        excluded_files = set(self.config.get("excluded_files", []))
+        moved_count = 0
+
+        for item in folder.iterdir():
+            if item.is_dir():
+                if item.name in excluded_folders:
+                    continue
+                # можно обрабатывать и папки? Пока пропускаем
+                continue
+            if item.name in excluded_files:
+                continue
+            # категория
+            cat = self.get_category(item.name)
+            dest = category_dirs.get(cat, folder / "Others")
+            if cat == "Others" and not (folder / "Others").exists() and not dry_run:
+                (folder / "Others").mkdir(parents=True)
+                dest = folder / "Others"
+            dest_path = dest / item.name
+            # проверяем, не существует ли уже такой файл
+            if dest_path.exists():
+                # добавляем суффикс
+                base = dest_path.stem
+                ext = dest_path.suffix
+                counter = 1
+                while True:
+                    new_name = f"{base}_{counter}{ext}"
+                    new_path = dest / new_name
+                    if not new_path.exists():
+                        dest_path = new_path
+                        break
+                    counter += 1
+            if not dry_run:
+                shutil.move(str(item), str(dest_path))
+                self.history.append((str(dest_path), str(item)))  # запоминаем для undo
+                logging.info(f"Перемещён {item.name} -> {cat}/")
+            moved_count += 1
+        logging.info(f"Обработано {moved_count} файлов" + (" (сухой запуск)" if dry_run else ""))
+        return moved_count
+
+    def undo_last(self, count=1):
+        """Отмена последних перемещений"""
+        undone = 0
+        for _ in range(min(count, len(self.history))):
+            src, dst = self.history.pop()
+            if Path(src).exists():
+                shutil.move(src, dst)
+                logging.info(f"Отмена: {Path(src).name} возвращён")
+                undone += 1
+            else:
+                logging.warning(f"Файл {src} уже не существует")
+        return undone
+
+    def run(self, folder_path, dry_run=False):
+        self.organize(folder_path, dry_run)
+
+# ==================== GUI ====================
+class OrganizerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("🧹 Органайзер рабочего стола")
+        self.root.geometry("800x600")
+        self.root.resizable(True, True)
+
+        self.organizer = DesktopOrganizer()
+        self.folder_path = tk.StringVar(value=str(Path.home() / "Desktop"))
+        self.dry_run = tk.BooleanVar(value=False)
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        # Верхняя панель
+        top_frame = ttk.Frame(self.root, padding=10)
+        top_frame.pack(fill=tk.X)
+        ttk.Label(top_frame, text="Папка:").pack(side=tk.LEFT)
+        ttk.Entry(top_frame, textvariable=self.folder_path, width=50).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="Обзор...", command=self.browse_folder).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(top_frame, text="Только показать (dry-run)", variable=self.dry_run).pack(side=tk.LEFT, padx=10)
+        ttk.Button(top_frame, text="▶️ Запустить сортировку", command=self.run_organize).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="↩️ Отменить последнее", command=self.undo_action).pack(side=tk.LEFT, padx=5)
+
+        # Лог-область
+        self.log_text = scrolledtext.ScrolledText(self.root, wrap=tk.WORD, state='normal', height=20)
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Статус
+        self.status_var = tk.StringVar(value="Готов")
+        ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(fill=tk.X, padx=10, pady=5)
+
+        # Перенаправим stdout в виджет
+        self.log_handler = LoggingHandler(self.log_text)
+        logging.getLogger().addHandler(self.log_handler)
+
+    def browse_folder(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.folder_path.set(path)
+
+    def run_organize(self):
+        folder = self.folder_path.get()
+        if not os.path.isdir(folder):
+            messagebox.showerror("Ошибка", "Папка не существует")
+            return
+        self.status_var.set("Сортировка...")
+        self.log_text.insert(tk.END, f"\n=== Запуск сортировки {datetime.now().strftime('%H:%M:%S')} ===\n")
+        self.root.update()
+        try:
+            moved = self.organizer.organize(folder, dry_run=self.dry_run.get())
+            self.status_var.set(f"Готово. Перемещено {moved} файлов.")
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
+            self.status_var.set("Ошибка")
+
+    def undo_action(self):
+        undone = self.organizer.undo_last(1)
+        self.log_text.insert(tk.END, f"Отменено {undone} перемещение(й)\n")
+        self.status_var.set(f"Отменено {undone}")
+
+class LoggingHandler(logging.Handler):
+    def __init__(self, text_widget):
+        super().__init__()
+        self.text_widget = text_widget
+
+    def emit(self, record):
+        msg = self.format(record)
+        self.text_widget.insert(tk.END, msg + "\n")
+        self.text_widget.see(tk.END)
+
+# ==================== CLI ====================
+def cli_main():
+    parser = argparse.ArgumentParser(description="Органайзер рабочего стола")
+    parser.add_argument("--path", default=str(Path.home() / "Desktop"), help="Папка для сортировки")
+    parser.add_argument("--config", help="Путь к файлу конфигурации JSON")
+    parser.add_argument("--dry-run", action="store_true", help="Только показать, что будет сделано")
+    parser.add_argument("--undo", type=int, default=0, help="Отменить N последних действий")
+    parser.add_argument("--log", help="Путь к файлу лога")
+    args = parser.parse_args()
+
+    org = DesktopOrganizer(args.config, args.log)
+    if args.undo > 0:
+        undone = org.undo_last(args.undo)
+        print(f"Отменено {undone} действий")
+    else:
+        org.run(args.path, args.dry_run)
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        cli_main()
+    elif GUI_AVAILABLE:
+        root = tk.Tk()
+        app = OrganizerGUI(root)
+        root.mainloop()
+    else:
+        print("Tkinter не установлен, запустите в режиме CLI с параметрами.")
